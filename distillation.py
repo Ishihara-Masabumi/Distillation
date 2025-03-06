@@ -354,7 +354,7 @@ def DiT_Llama_3B_patch2(**kwargs):
     return DiT_Llama(patch_size=2, dim=3072, n_layers=32, n_heads=32, **kwargs)
 
 #---------------------------------------------------------------------------------------------------------
-#--------------------------------------------------RF-----------------------------------------------------
+#----------------------------------------------InstaFlow--------------------------------------------------
 #---------------------------------------------------------------------------------------------------------
 
 def output_directory(outputs):
@@ -390,58 +390,88 @@ def output_directory(outputs):
 
     return img_dir
 
-class RF:
-    def __init__(self, model, ln=True):
+class InstaFlow(nn.Module):
+    def __init__(self, model, timesteps=5):
+        super().__init__()
         self.model = model
-        self.ln = ln
+        self.timesteps = timesteps
+        if self.timesteps < 2:
+            print("timesteps is wrong.")
+            return
 
     def forward(self, x, cond):
         b = x.size(0)
-        if self.ln:
-            nt = torch.randn((b,)).to(x.device)
-            t = torch.sigmoid(nt)
-        else:
-            t = torch.rand((b,)).to(x.device)
-        texp = t.view([b, *([1] * len(x.shape[1:]))])
+        device = x.device
+        t_grid = torch.linspace(0, 1, steps=self.timesteps, device=device)
+        n = torch.randint(1, self.timesteps, (b,), device=device)
+        t = t_grid[n]
+        texp = t.view(b, 1, 1, 1)
         z1 = torch.randn_like(x)
+        z1 = torch.clamp(z1, min=-3.0, max=3.0)
         zt = (1 - texp) * x + texp * z1
         vtheta = self.model(zt, t, cond)
         batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
-        tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
-        ttloss = [(tv, tloss) for tv, tloss in zip(t, tlist)]
-        return batchwise_mse.mean(), ttloss
+        return batchwise_mse.mean(), None
 
     @torch.no_grad()
-    def sample(self, z, cond, null_cond=None, sample_steps=50, cfg=2.0):
+    def sample(self, z, cond, null_cond=None, cfg=2.0, steps=None):
         b = z.size(0)
-        dt = 1.0 / sample_steps
-        dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
+        device = z.device
+        steps = steps if steps is not None else self.timesteps
+        dt = 1.0 / (steps - 1)
         images = [z]
-        for i in range(sample_steps, 0, -1):
-            t = i / sample_steps
-            t = torch.tensor([t] * b).to(z.device)
-
+        for i in reversed(range(1, steps)):
+            t = torch.full((b,), i / (steps - 1), device=device)
             vc = self.model(z, t, cond)
             if null_cond is not None:
                 vu = self.model(z, t, null_cond)
                 vc = vu + cfg * (vc - vu)
-
             z = z - dt * vc
             images.append(z)
-        return images
+        return images[-1]
+
+    @torch.no_grad()
+    def generate_pairs(self, x, cond):
+        b = x.size(0)
+        device = x.device
+        z1 = torch.randn_like(x)
+        z1 = torch.clamp(z1, min=-3.0, max=3.0)
+        x0 = self.sample(z1, cond)
+        return x0, z1
+
+    def reflow(self, x0, z1, cond):
+        b = x0.size(0)
+        device = x0.device
+        t_grid = torch.linspace(0, 1, steps=self.timesteps, device=device)
+        n = torch.randint(1, self.timesteps, (b,), device=device)
+        t = t_grid[n]
+        texp = t.view(b, 1, 1, 1)
+        zt = (1 - texp) * x0 + texp * z1
+        vtheta = self.model(zt, t, cond)
+        batchwise_mse = ((z1 - (x0 + vtheta)) ** 2).mean(dim=list(range(1, len(x0.shape))))
+        return batchwise_mse.mean(), None
+
+    def distill(self, x, z, cond):
+        b = x.size(0)
+        device = x.device
+        t = torch.rand(b, device=device) * 0.2 + 0.8  # 0.8〜1.0 の範囲
+        vtheta = self.model(z, t, cond)  # モデルの予測
+        batchwise_mse = ((x - z + vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))  # 修正
+        return batchwise_mse.mean(), None
 
 #---------------------------------------------------------------------------------------------------------
 #---------------------------------------------main--------------------------------------------------------
 #---------------------------------------------------------------------------------------------------------
 
 def main():
+    import os
 
     import numpy as np
     import torch.optim as optim
     from PIL import Image
     from torch.utils.data import DataLoader
     from torchvision import datasets, transforms
-    from torchvision.utils import make_grid
+    from torchvision.utils import make_grid, save_image
     from tqdm import tqdm
 
     # device の設定
@@ -457,6 +487,8 @@ def main():
     epochs = 1000
     lr = 5e-4
 
+    num_triplets = 50000
+
     # 出力先ディレクトリの作成
     img_dir = output_directory("outputs")
 
@@ -470,72 +502,116 @@ def main():
         ]
     )
 
-    model = DiT_Llama(
+    model1 = DiT_Llama(
+        in_channels=channels, input_size=image_size, dim=256, n_layers=10, n_heads=8, num_classes=classes
+    ).cuda()
+    model2 = DiT_Llama(
+        in_channels=channels, input_size=image_size, dim=256, n_layers=10, n_heads=8, num_classes=classes
+    ).cuda()
+    model3 = DiT_Llama(
         in_channels=channels, input_size=image_size, dim=256, n_layers=10, n_heads=8, num_classes=classes
     ).cuda()
 
-    model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size = sum(p.numel() for p in model1.parameters() if p.requires_grad)
     print(f"Number of parameters: {model_size}, {model_size / 1e6}M")
 
-    rf = RF(model)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = torch.nn.MSELoss()
+    instaf1 = InstaFlow(model1, timesteps=100).to(device)
+    instaf2 = InstaFlow(model2, timesteps=100).to(device)
+    instaf3 = InstaFlow(model3, timesteps=100).to(device)
 
-    dataset = fdatasets(root="./data", train=True, download=True, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    # samples/unet_insta_flow.pthをUnetにロード
+    checkpoint_path = "outputs/unet_insta_flow_883.pth"
+    if os.path.exists(checkpoint_path):
+        print(f"Loading pre-trained model from {checkpoint_path}...")
+        instaf1.model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    else:
+        print(f"Checkpoint file {checkpoint_path} not found. Using newly initialized model.")
+
+    optimizer2 = optim.Adam(instaf2.parameters(), lr=5e-4)
+    optimizer3 = optim.Adam(instaf3.parameters(), lr=5e-4)
+
+    instaf1.model.to(device)
+    instaf1.model.eval()
+
+    # Step 1: 既存のモデルからトリプレットを生成
+    print("Step 1: Generating (text, noise, image) triplets from Stable Diffusion...")
+    # 教師データのトリプレット (labels, teacher_time, teacher_images) をバッチ単位で生成
+    triplets = []
+    for _ in tqdm(range(num_triplets // batch_size), desc="Generating teacher triplets"):
+        # 0～9の整数ラベルをランダムに生成
+        labels = torch.randint(0, 10, (batch_size,), device=device)
+        z = torch.randn(batch_size, channels, image_size, image_size).to(device)
+        # EDMモデルから教師画像を生成（ラベルを条件として渡す）
+        teacher_images = instaf1.sample(z, labels)
+        # トリプレットとして (labels, teacher_time, teacher_images) を保存
+        triplets.append((labels, teacher_images))
+
+    # Step 2: 2-Rectified Flowのトレーニング (修正箇所)
+    print("Step 2: Training 2-Rectified Flow with text-conditioned reflow...")
 
     for epoch in range(epochs):
-        losses = []
-        bar = tqdm(dataloader, desc=f"Epoch {epoch}", total=len(dataloader))
-        model.train()
-        lossbin = {i: 0 for i in range(10)}
-        losscnt = {i: 1e-6 for i in range(10)}
-        
-        for batch in bar: # この行を変更
+        total_loss = 0
+        # triplets全体を回して学習
+        for labels, images in tqdm(triplets, desc=f"Epoch {epoch+1} (2-Rectified)"):
+            images, labels = images.to(device), labels.to(device)
+            noises = torch.randn(batch_size, channels, image_size, image_size).to(device)
 
-            x, c = batch # この行を変更してタプルをアンパックするようにしました
-            x, c = x.cuda(), c.cuda()
-            optimizer.zero_grad()
-            loss, blsct = rf.forward(x, c)
+            # reflow学習
+            loss, _ = instaf2.reflow(images, noises, labels)
+            total_loss += loss.item()
+
+            optimizer2.zero_grad()
             loss.backward()
-            optimizer.step()
-            losses.append(loss.item())
-            bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
+            torch.nn.utils.clip_grad_norm_(instaf2.parameters(), max_norm=1.0)
+            optimizer2.step()
 
-            # count based on t
-            for t, l in blsct:
-                lossbin[int(t * 10)] += l
-                losscnt[int(t * 10)] += 1
+        avg_loss = total_loss / len(triplets)
+        print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.6f}")
 
-        # log
-        for i in range(10):
-            print(f"Epoch: {epoch}, {i} range loss: {lossbin[i] / losscnt[i]}")
+        # サンプル生成
+        z_sample = torch.randn(16, 3, 32, 32).to(device)
+        cond_sample = torch.arange(0, 16).to(device) % 10
+        generated = instaf2.sample(z_sample, cond_sample)
+        save_image(generated, f"samples/stage2_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
-        rf.model.eval()
-        with torch.no_grad():
-            cond = torch.arange(0, 16).cuda() % classes
-            uncond = torch.ones_like(cond) * classes
+    torch.save(instaf2.state_dict(), "checkpoints/2_rectified.pth")
 
-            init_noise = torch.randn(16, channels, image_size, image_size).cuda()
-            images = rf.sample(init_noise, cond, uncond, timesteps, cfg)
-            # image sequences to gif
-            gif = []
-            for image in images:
-                # unnormalize
-                image = image * 0.5 + 0.5
-                image = image.clamp(0, 1)
-                x_as_image = make_grid(image.float(), nrow=4)
-                img = x_as_image.permute(1, 2, 0).cpu().numpy()
-                img = (img * 255).astype(np.uint8)
-                gif.append(Image.fromarray(img))
+    # Step 3: One-Step InstaFlowへの蒸留
+    print("Step 3: Distilling to One-Step InstaFlow...")
+    for epoch in range(epochs):
+        total_loss = 0
+        for labels, images in tqdm(triplets, desc=f"Epoch {epoch+1} (Distillation)"):
+            images, labels = images.to(device), labels.to(device)
+            noises = torch.randn(batch_size, channels, image_size, image_size).to(device)
 
-            last_img = gif[-1]
-            last_img.save(f"{img_dir}/sample_epoch{epoch}.png")
+            # 毎バッチでペアを生成
+            z0, z1 = instaf2.generate_pairs(images, labels)
 
-        # 学習したモデルの保存
-        torch.save(model.state_dict(), img_dir / f"rectified_flow_epoch{epoch}.pth")
+            loss, _ = instaf3.distill(z0, noises, labels)
+            total_loss += loss.item()
 
-    print("Training complete.")
+            optimizer3.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(instaf3.parameters(), max_norm=1.0)
+            optimizer3.step()
+
+        avg_loss = total_loss / len(triplets)
+        print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}")
+
+        z_sample = torch.randn(16, 3, 32, 32).to(device)
+        cond_sample = torch.arange(0, 16).to(device) % 10
+        generated = instaf3.sample(z_sample, cond_sample, steps=2)
+        save_image(generated, f"samples/stage3_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
+
+    torch.save(instaf3.state_dict(), "checkpoints/instaflow.pth")
+
+    print("Generating final samples...")
+    z = torch.randn(16, channels, image_size, image_size).to(device)
+    cond_final = torch.arange(0, 16).to(device) % classes
+    generated = instaf3.sample(z, cond_final, steps=2)
+    save_image(generated, f"samples/final_samples.png", nrow=4, normalize=True)
+    print(f"Generated shape: {generated.shape}")
 
 if __name__ == "__main__":
     main()
+
